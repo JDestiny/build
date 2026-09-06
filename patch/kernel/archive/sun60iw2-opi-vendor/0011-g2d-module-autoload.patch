@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cubie A7S Community <cubie-a7s@localhost>
+Date: Thu, 27 Aug 2026 00:00:00 +0000
+Subject: [PATCH] g2d: export OF device table so the module auto-loads
+
+The vendor g2d driver (RCQ variant, the one built with G2D_LEGACY=n)
+declares an of_device_id match table but never exports it with
+MODULE_DEVICE_TABLE, so the module has no modalias and udev cannot
+auto-load g2d_sunxi when the g2d DT node is present. Add the export;
+with it the module is loaded on boot and /dev/g2d appears.
+
+Signed-off-by: Cubie A7S Community <cubie-a7s@localhost>
+---
+
+diff --git a/bsp/drivers/g2d/g2d_rcq/g2d.c b/bsp/drivers/g2d/g2d_rcq/g2d.c
+index dea703b5ed..36fa76466d 100644
+--- a/bsp/drivers/g2d/g2d_rcq/g2d.c
++++ b/bsp/drivers/g2d/g2d_rcq/g2d.c
+@@ -1655,6 +1655,7 @@ static const struct of_device_id sunxi_g2d_match[] = {
+ 	{.compatible = "allwinner,sunxi-g2d",},
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, sunxi_g2d_match);
+ 
+ static struct platform_driver g2d_driver = {
+ 	.probe = g2d_probe,

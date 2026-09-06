@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cubie A7S Community <cubie-a7s@localhost>
+Date: Thu, 27 Aug 2026 00:00:00 +0000
+Subject: [PATCH] net: phy: add Maxio MAE0621A PHY driver (LED config)
+
+The Radxa Cubie A7S uses a Maxio (Lianyun) MAE0621A Ethernet PHY
+(RTL8211F compatible, PHY ID 0x7b744412, PHYAD=1).  The board routes
+PHY_LED1 (green, active-high) and PHY_LED2 (amber, active-low) to
+the RJ45 LEDs.  Radxa's official OS keeps the LEDs at the factory OTP
+configuration (page 0xd04 reg 16 = 0x2f71): amber steady = link
+established, green blinks on activity.  This driver writes the same
+register in config_init so phylib re-applies it on every PHY
+soft-reset / re-init, keeping the LED behaviour identical to the
+official OS regardless of OTP/batch variations.
+
+Without a specific driver the PHY falls back to the Generic PHY
+driver and the LEDs keep their OTP-programmed behaviour (measured
+0x2f71 on this board; 0x6251 is only the datasheet reset default).
+Radxa's vendor kernel ships its own "maxio" PHY driver which never
+touches the LED page, so the LED behaviour is effectively fixed at
+factory time.  Add a small GPL PHY driver that writes the LED
+register in config_init, so phylib re-applies it on every PHY
+soft-reset / re-init.
+
+Verified on Cubie A7S: driver bound at boot, register reads 0x2f71,
+forcing 0x6251 then cycling the link re-applies 0x2f71 automatically,
+link stays 1000M.
+
+Signed-off-by: Cubie A7S Community <cubie-a7s@localhost>
+---
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index 107880d13d..7ad809b5df 100644
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -338,6 +338,16 @@ config REALTEK_PHY
+ 	help
+ 	  Supports the Realtek 821x PHY.
+ 
++config MAE0621A_PHY
++	tristate "Maxio MAE0621A PHY"
++	depends on MDIO_DEVICE
++	help
++	  Supports the Maxio MAE0621A Ethernet PHY (RTL8211F compatible,
++	  PHY ID 0x7b744412) used on the Radxa Cubie A7S.  Configures the
++	  PHY LEDs (amber steady = link, green = activity, page 0xd04
++	  reg16 = 0x2f71) in config_init so the setting is re-applied
++	  automatically after PHY resets.
++
+ config RENESAS_PHY
+ 	tristate "Renesas PHYs"
+ 	help
+diff --git a/drivers/net/phy/Makefile b/drivers/net/phy/Makefile
+index c945ed9bd1..cb969354b1 100644
+--- a/drivers/net/phy/Makefile
++++ b/drivers/net/phy/Makefile
+@@ -88,6 +88,7 @@ obj-$(CONFIG_NXP_CBTX_PHY)	+= nxp-cbtx.o
+ obj-$(CONFIG_NXP_TJA11XX_PHY)	+= nxp-tja11xx.o
+ obj-$(CONFIG_QSEMI_PHY)		+= qsemi.o
+ obj-$(CONFIG_REALTEK_PHY)	+= realtek.o
++obj-$(CONFIG_MAE0621A_PHY)	+= mae0621a.o
+ obj-$(CONFIG_RENESAS_PHY)	+= uPD60620.o
+ obj-$(CONFIG_ROCKCHIP_PHY)	+= rockchip.o
+ obj-$(CONFIG_SMSC_PHY)		+= smsc.o
+diff --git a/drivers/net/phy/mae0621a.c b/drivers/net/phy/mae0621a.c
+new file mode 100644
+index 0000000000..00e38087e4
+--- /dev/null
++++ b/drivers/net/phy/mae0621a.c
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Maxio (联芸) MAE0621A Ethernet PHY driver (RTL8211F compatible)
++ *
++ * LED configuration: page 0xd04 reg16 = 0x2f71 (amber LED steady =
++ * link, green LED = activity blink, matching the Radxa official OS
++ * behaviour), written in config_init so it is re-applied by phylib
++ * on every PHY soft-reset/re-init.
++ */
++#include <linux/module.h>
++#include <linux/phy.h>
++
++#define MAE0621A_PHY_ID		0x7b744412
++#define MAE0621A_PHY_ID_MASK	0xfffffff0	/* ignore low 4 bits (revision) */
++
++/* This PHY uses reg31 as the page-select register (RTL8211F family) */
++#define MAE0621A_REG_PAGE	0x1f
++#define MAE0621A_PAGE_LED	0xd04		/* LED function page */
++#define MAE0621A_PAGE_NORMAL	0xa42		/* normal MII page (measured restore value) */
++#define MAE0621A_LED_REG	16		/* LED function control register */
++#define MAE0621A_LED_VALUE	0x2f71		/* official OS config: amber steady=link, green=activity */
++
++static int mae0621a_config_init(struct phy_device *phydev)
++{
++	int ret;
++
++	/* switch to the LED function page */
++	ret = phy_write(phydev, MAE0621A_REG_PAGE, MAE0621A_PAGE_LED);
++	if (ret)
++		return ret;
++
++	/* write the LED configuration */
++	ret = phy_write(phydev, MAE0621A_LED_REG, MAE0621A_LED_VALUE);
++	if (ret)
++		goto restore;
++
++	phydev_info(phydev, "LED configured: page 0x%04x reg%d = 0x%04x\n",
++		    MAE0621A_PAGE_LED, MAE0621A_LED_REG, MAE0621A_LED_VALUE);
++
++restore:
++	/* restore the normal MII page on both paths so later MII accesses hit the right page */
++	phy_write(phydev, MAE0621A_REG_PAGE, MAE0621A_PAGE_NORMAL);
++	return ret;
++}
++
++static struct phy_driver mae0621a_driver[] = {
++	{
++		.phy_id		= MAE0621A_PHY_ID,
++		.phy_id_mask	= MAE0621A_PHY_ID_MASK,
++		.name		= "MAE0621A",
++		.config_init	= mae0621a_config_init,
++		.config_aneg	= genphy_config_aneg,
++		.read_status	= genphy_read_status,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++	},
++};
++
++module_phy_driver(mae0621a_driver);
++
++static struct mdio_device_id mae0621a_tbl[] = {
++	{ MAE0621A_PHY_ID, MAE0621A_PHY_ID_MASK },
++	{ }
++};
++MODULE_DEVICE_TABLE(mdio, mae0621a_tbl);
++
++MODULE_DESCRIPTION("Maxio MAE0621A Ethernet PHY driver");
++MODULE_AUTHOR("Cubie A7S Armbian port");
++MODULE_LICENSE("GPL v2");
