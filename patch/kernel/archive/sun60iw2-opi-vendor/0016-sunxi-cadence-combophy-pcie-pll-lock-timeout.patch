@@ -1,0 +1,106 @@
+From: Cubie A7S bringup <local>
+Subject: [PATCH] media: sunxi: bound the combo-PHY PLL lock wait in the PCIe 100M init
+
+
+sunxi_cadence_phy_pcie_internal_100m_init() waits for the combo PHY PLL to
+lock with an unbounded loop:
+
+        val = readl(combo1->top_reg + 0x900);
+        while (true) {
+                udelay(100);
+                val = readl(combo1->top_reg + 0x900);
+                if (val & BIT(0))
+                        break;
+        }
+
+There is no settle delay and no timeout, so if the PLL never reports lock --
+cold boot with a marginal supply, wrong combo mode, or a PHY that simply does
+not come up -- the kernel spins here without ever yielding.  This runs from the
+PCIe host probe path, so the visible effect is a board that never finishes
+booting, with no log line explaining why (radxa-build/radxa-a733 issue #10 has
+the NVMe variant of that failure: "link enumerated before it was stable").
+
+Turn it into a bounded poll: 100 us per iteration, 2000 iterations (200 ms),
+which is far above the ~100 us a healthy PLL needs.  On timeout, log the
+register value and return early instead of continuing to program a PHY that is
+not locked.
+
+Two neighbouring "findings" from the same issue were checked against this tree
+and are deliberately NOT changed here:
+
+  * pcie-sunxi-rc.c:sunxi_pcie_host_speed_change() does wait after requesting a
+    speed change -- sunxi_pcie_host_wait_for_speed_change() polls
+    PORT_LOGIC_SPEED_CHANGE with LINK_WAIT_MAX_RETRIE retries and returns
+    -ETIMEDOUT.  It is bounded already; the only open question is whether it
+    should additionally wait for the link to retrain at the new rate, which is
+    a behaviour change nobody has reproduced as a failure.
+
+  * sunxi_msi_set_affinity() is a stub returning -EINVAL, so MSI interrupts all
+    land on CPU0.  That costs interrupt distribution under random IO, not
+    correctness, and a correct implementation has to forward to the GIC parent
+    domain -- not something to guess at in a bring-up patch.
+
+Baseline: the tree Armbian actually builds, orangepi-xunlong/linux-orangepi
+branch orange-pi-6.6-sun60iw2, file bsp/drivers/phy/sunxi-cadence-combophy.c
+(md5 566c295c0885…).
+
+Signed-off-by: Cubie A7S bringup <local>
+---
+diff --git a/bsp/drivers/phy/sunxi-cadence-combophy.c b/bsp/drivers/phy/sunxi-cadence-combophy.c
+--- a/bsp/drivers/phy/sunxi-cadence-combophy.c
++++ b/bsp/drivers/phy/sunxi-cadence-combophy.c
+@@ -3705,6 +3705,14 @@
+ };
+ 
+ static void sunxi_cadence_phy_pcie_internal_100m_init(struct sunxi_cadence_phy *sunxi_cphy)
++/*
++ * Upper bound for the combo PHY PLL lock wait in the 100M-refclk init.
++ * The poll loop used to be unlimited; 200 ms is far above the ~100 us a
++ * healthy PLL needs, and turns a cold-boot hang into a logged error.
++ */
++#define PCIE_PLL_LOCK_POLL_US		100
++#define PCIE_PLL_LOCK_MAX_RETRIES	2000
++
+ {
+ 	struct sunxi_cadence_combophy *combo1 = sunxi_cphy->combo1;
+ 	u32 val;
+@@ -3708,6 +3708,7 @@
+ {
+ 	struct sunxi_cadence_combophy *combo1 = sunxi_cphy->combo1;
+ 	u32 val;
++	int retries;
+ 
+ 	writel(0x01100001, combo1->top_reg + 0x4);
+ 
+@@ -3839,12 +3839,25 @@
+ 	writel(val | 0x1, combo1->top_reg + 0x100);
+ 
+ 	val = readl(combo1->top_reg + 0x900);
+-	while (true) {
+-		udelay(100);
+-		val = readl(combo1->top_reg + 0x900);
+-		if (val & BIT(0))
+-			break;
+-	}
++	/*
++	 * Wait for the combo PHY PLL to lock.  This was an unbounded loop:
++	 * if the PLL never locks (cold boot, marginal supply, wrong combo
++	 * mode) the kernel spun here forever inside the PCIe host probe
++	 * path and the board never finished booting.  Give it a generous
++	 * but finite budget and report the failure instead of hanging.
++	 */
++	for (retries = 0; retries < PCIE_PLL_LOCK_MAX_RETRIES; retries++) {
++		if (val & BIT(0))
++			break;
++		udelay(PCIE_PLL_LOCK_POLL_US);
++		val = readl(combo1->top_reg + 0x900);
++	}
++	if (!(val & BIT(0))) {
++		dev_err(sunxi_cphy->dev,
++			"PCIE PLL lock timeout (top+0x900 = %#x), aborting 100M init\n",
++			val);
++		return;
++	}
+ 
+ 	val = readw(combo1->phy_reg + 0xa0);
+ 	val |= 0x220;

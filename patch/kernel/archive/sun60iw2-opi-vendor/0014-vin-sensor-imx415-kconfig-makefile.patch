@@ -1,0 +1,69 @@
+From: Cubie A7S bringup <local>
+Subject: [PATCH] media: sunxi-vin: wire up the orphan imx415 sensor driver
+
+bsp/drivers/vin/modules/sensor/imx415_mipi.c is present in the Armbian
+sun60iw2 kernel tree (linux-orangepi orange-pi-6.6-sun60iw2, 33487 bytes) and
+already carries the 6.6 API guards, but nothing ever compiles it:
+
+  * the sensor Kconfig has no SENSOR_IMX415 symbol, and
+  * the sensor Makefile has no obj-$(CONFIG_SENSOR_IMX415) line,
+
+so Radxa's Camera 4K (IMX415) can never work, even though Radxa's own BSP
+branch already wires it up (radxa/allwinner-bsp@cubie-aiot-v1.4.8 has
+"config SENSOR_IMX415" in Kconfig and "obj-$(CONFIG_SENSOR_IMX415) +=
+imx415_mipi.o" in the Makefile, and Radxa's 5.15 image ships
+CONFIG_SENSOR_IMX415=m).
+
+Upstream context: radxa/allwinner-bsp@cubie-aiot-v1.4.8 does wire this driver
+up (config SENSOR_IMX415 with prompt "use imx415 driver" at Kconfig:155 and
+obj-$(CONFIG_SENSOR_IMX415) += imx415_mipi.o at Makefile:39), but the newer
+cubie-aiot-v1.5.0 branch DROPPED it again, and the tree Armbian builds for this
+family inherited that state.  This patch restores the last known-good wiring,
+prompt text included.
+
+Add the missing symbol right before SENSOR_IMX477 -- the position the driver
+occupies in Radxa's tree and in the 5.15 config -- plus the matching Makefile
+line.  Note the Kconfig prompt ("use imx415 driver") is *not* what the camera
+overlay matches on: the overlay's sensor0_mname = "imx415_mipi" matches the
+driver name the module registers (SENSOR_NAME below), not the prompt text.
+
+The driver registers two i2c driver names, "imx415_mipi" and "imx415_mipi_2"
+(SENSOR_NUM == 2), which is how the module exposes the 1-lane and 2-lane
+variants of the part.
+
+Baseline (verified against the real build tree, not a stand-in):
+  linux-orangepi orange-pi-6.6-sun60iw2
+    bsp/drivers/vin/modules/sensor/Kconfig   md5 b9eebae1b300
+    bsp/drivers/vin/modules/sensor/Makefile  md5 d54f47b9c643
+  (Kconfig: SENSOR_IMX326 at :155, SENSOR_IMX477 at :159
+   Makefile: SENSOR_IMX326 at :39,  SENSOR_IMX477 at :40)
+
+Signed-off-by: Cubie A7S bringup <local>
+---
+diff --git a/bsp/drivers/vin/modules/sensor/Kconfig b/bsp/drivers/vin/modules/sensor/Kconfig
+--- a/bsp/drivers/vin/modules/sensor/Kconfig
++++ b/bsp/drivers/vin/modules/sensor/Kconfig
+@@ -156,6 +156,10 @@
+ 	tristate "use imx326 driver"
+ 	default n
+ 
++config SENSOR_IMX415
++	tristate "use imx415 driver"
++	default n
++
+ config SENSOR_IMX477
+ 	tristate "use imx477 driver"
+ 	default n
+ 
+diff --git a/bsp/drivers/vin/modules/sensor/Makefile b/bsp/drivers/vin/modules/sensor/Makefile
+--- a/bsp/drivers/vin/modules/sensor/Makefile
++++ b/bsp/drivers/vin/modules/sensor/Makefile
+@@ -37,6 +37,7 @@
+ obj-$(CONFIG_SENSOR_IMX317)			+= imx317_mipi.o
+ obj-$(CONFIG_SENSOR_IMX335)			+= imx335_mipi.o
+ obj-$(CONFIG_SENSOR_IMX326)			+= imx326_mipi.o
++obj-$(CONFIG_SENSOR_IMX415)			+= imx415_mipi.o
+ obj-$(CONFIG_SENSOR_IMX477)			+= imx477_mipi.o
+ obj-$(CONFIG_SENSOR_OV2710)			+= ov2710_mipi.o
+ obj-$(CONFIG_SENSOR_OV2718)			+= ov2718_mipi.o
+ 

@@ -1,0 +1,339 @@
+From: Cubie A7S bringup <local>
+Subject: [PATCH] watchdog: add the AXP2101-family PMIC watchdog and AXP8191 power-off
+
+watchdog: add the AXP2101-family PMIC watchdog and AXP8191 power-off
+
+Port of the still-open Radxa PR radxa/allwinner-bsp#17 ("AXP8191 PMIC
+watchdog + power-off"), which our vendor tree does not carry yet.  The A733
+boards put an AXP8191 (AXP2101 family) PMIC on TWI0 at 0x36 and wire its
+watchdog to the PMIC's own RESTART mode: on expiry the PMIC power-cycles the
+board, i.e. it can reset rails that the SoC watchdog cannot reach.  The same
+PR also gives AXP8191 a proper power-off sequence, which the generic
+"write AXP20X_OFF to AXP20X_OFF_CTRL" path does not provide on this part.
+
+Four pieces, all taken from the PR:
+
+  1. bsp/drivers/watchdog/axp2xx_wdt.c   -- new driver (180 lines, verbatim)
+  2. bsp/drivers/watchdog/Kconfig        -- config AW_AXP_WATCHDOG
+  3. bsp/drivers/watchdog/Makefile       -- obj-$(CONFIG_AW_AXP_WATCHDOG)
+  4. bsp/drivers/power/mfd/axp2101.c     -- <linux/reboot.h>, the AXP8191
+     branch in axp20x_power_off(), and a sys_off handler so power-off uses it
+
+NOT CARRIED OVER: the PR also adds the "axp2xx-watchdog" MFD cell to
+axp8191_cells[].  Our tree already has it (bsp/drivers/power/mfd/axp2101.c:
+2190-2193, name + of_compatible "x-powers,axp2xx-watchdog"), so adding it
+again would produce a duplicate cell.  Everything else in the PR is needed.
+
+Driver behaviour worth knowing before enabling it
+-------------------------------------------------
+  * Register 0x77 (AXP8191_WATCHDOG_CFG): [7] enable, [6] clock enable,
+    [5:4] action (11b = RESTART), [3] feed, [2:0] period 1..128 s.
+  * probe() explicitly clears the enable bit, so merely building the driver
+    and describing the DT node does NOT arm the PMIC watchdog -- it stays
+    off until user space opens the device.  A missing/incorrect DT node is
+    therefore harmless; a boot loop cannot come from the driver alone.
+  * nowayout follows CONFIG_WATCHDOG_NOWAYOUT, which is unset in our config
+    (same as the SoC watchdog today), so a clean shutdown can stop it.
+
+Two watchdogs will exist after this patch
+-----------------------------------------
+The board already has the SoC watchdog (/dev/watchdog0, BSP sunxi_wdt.c,
+max 16 s) held by systemd with RuntimeWatchdogSec=16.  With this patch the
+PMIC one registers as a second device.  Whether both are armed depends only
+on what user space opens: systemd drives /dev/watchdog, i.e. the device that
+got the lowest minor (normally watchdog0).  Only the opened device is armed
+by the driver, so the two cannot both time out at once by accident -- but
+which one systemd picks MUST be verified after the first boot
+(cat /sys/class/watchdog/watchdog*/identity, wdctl, systemctl show).
+If systemd ends up on the PMIC device, its expiry is a full PMIC power-cycle
+instead of a SoC reset; that is the intended behaviour of RESTART mode, and
+it is safe on an SD-card system (no brick risk), but it makes the board look
+like it lost power.  Use WatchdogDevice= in systemd if the SoC one is wanted
+as the primary.
+
+Acceptance criteria (to be checked on the running system, not in this patch):
+  A. ls /sys/class/watchdog/            -> the axp2xx device appears
+  B. cat /sys/class/watchdog/watchdog*/identity
+                                        -> one is "axp2xx pmic watchdog"
+  C. systemctl show -p RuntimeWatchdogUSec
+     + dmesg | grep -i watchdog         -> which device was acquired
+  D. wdctl <pmic dev>                   -> shows "stopped" while unopened
+  E. poweroff                           -> board really powers down (AXP8191
+                                           sequence), not just halts
+  F. rollback: drop the DTS node (0020) or set CONFIG_AW_AXP_WATCHDOG=n
+
+Baseline: Orange Pi vendor tree, the one Armbian actually builds for this
+  family (config/sources/families/sun60iw2.conf -> linux-orangepi
+  orange-pi-6.6-sun60iw2).  The BSP subtrees come from the same tree, i.e.
+  bsp/drivers/{watchdog,power/mfd,power/include}/.  Verified against
+  radxa/allwinner-bsp:cubie-aiot-v1.4.8: identical Kconfig context, identical
+  Makefile shape, AXP8191_POWER_DISABLE_POWER_DOWN_SEQUENCE = 0x55 in both
+  (bsp/drivers/power/include/axp2101.h:1051 here, :1052 there).
+
+Signed-off-by: Cubie A7S bringup <local>
+
+diff --git a/bsp/drivers/watchdog/Kconfig b/bsp/drivers/watchdog/Kconfig
+--- a/bsp/drivers/watchdog/Kconfig
++++ b/bsp/drivers/watchdog/Kconfig
+@@ -10,4 +10,14 @@
+ 	help
+ 	  Say Y here to support the watchdog timer in Allwinner SoCs.
+ 
++config AW_AXP_WATCHDOG
++	tristate "Watchdog support for X-Powers AXP2101-family PMIC"
++	depends on AW_MFD_AXP2101
++	select WATCHDOG
++	select WATCHDOG_CORE
++	help
++	  Say Y here to support the watchdog in X-Powers AXP2101-family
++	  PMICs (AXP318W / AXP8191). Its RESTART timeout mode power-cycles
++	  the PMIC, resetting rails the SoC watchdog cannot reach.
++
+ endmenu
+diff --git a/bsp/drivers/watchdog/Makefile b/bsp/drivers/watchdog/Makefile
+--- a/bsp/drivers/watchdog/Makefile
++++ b/bsp/drivers/watchdog/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ obj-$(CONFIG_AW_WATCHDOG) += sunxi_wdt.o
+-
++obj-$(CONFIG_AW_AXP_WATCHDOG) += axp2xx_wdt.o
+diff --git a/bsp/drivers/watchdog/axp2xx_wdt.c b/bsp/drivers/watchdog/axp2xx_wdt.c
+new file mode 100644
+--- /dev/null
++++ b/bsp/drivers/watchdog/axp2xx_wdt.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Watchdog driver for X-Powers AXP2101-family PMICs (AXP318W / AXP8191).
++ *
++ * Binds the "x-powers,axp2xx-watchdog" MFD cell registered by the AW
++ * axp2101 MFD core and drives it over the parent MFD regmap.
++ *
++ * Single control register REG 0x77 (AXP8191_WATCHDOG_CFG), verified against
++ * AXP318W datasheet V0.1 sec 6.9 / 6.11.2.81:
++ *   [7]   module enable      (1 = on)
++ *   [6]   module clock enable(1 = on)
++ *   [5:4] timeout action     11b = RESTART (PMIC power off then on)
++ *   [3]   timer clear / feed (write 1, auto-clears)
++ *   [2:0] timeout period     0..7 = 1,2,4,8,16,32,64,128 s
++ *
++ * RESTART mode gives a full PMIC power-cycle that the SoC (sunxi) watchdog
++ * cannot do -- it resets the PMIC rails, not just the SoC.
++ */
++
++#include <linux/bitops.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/watchdog.h>
++
++#define AXP_WDT_CFG_REG		0x77
++#define AXP_WDT_EN		BIT(7)
++#define AXP_WDT_CLK_EN		BIT(6)
++#define AXP_WDT_MODE_MASK	GENMASK(5, 4)
++#define AXP_WDT_MODE_RESTART	(0x3 << 4)
++#define AXP_WDT_CLR		BIT(3)
++#define AXP_WDT_TIMEOUT_MASK	GENMASK(2, 0)
++
++#define AXP_WDT_MIN_TIMEOUT	1
++#define AXP_WDT_MAX_TIMEOUT	128
++#define AXP_WDT_DEF_TIMEOUT	16
++
++/* register value (0..7) -> timeout in seconds */
++static const unsigned int axp_wdt_timeout[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
++
++static bool nowayout = WATCHDOG_NOWAYOUT;
++module_param(nowayout, bool, 0);
++MODULE_PARM_DESC(nowayout,
++	"Watchdog cannot be stopped once started (default="
++	__MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
++
++struct axp_wdt {
++	struct watchdog_device wdt;
++	struct regmap *regmap;
++};
++
++/* smallest register step >= requested seconds */
++static int axp_wdt_sel(unsigned int timeout)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(axp_wdt_timeout); i++)
++		if (axp_wdt_timeout[i] >= timeout)
++			return i;
++
++	return ARRAY_SIZE(axp_wdt_timeout) - 1;
++}
++
++static int axp_wdt_set_timeout(struct watchdog_device *wdd,
++			       unsigned int timeout)
++{
++	struct axp_wdt *w = watchdog_get_drvdata(wdd);
++	int sel = axp_wdt_sel(timeout);
++	int ret;
++
++	ret = regmap_update_bits(w->regmap, AXP_WDT_CFG_REG,
++				 AXP_WDT_TIMEOUT_MASK, sel);
++	if (ret)
++		return ret;
++
++	wdd->timeout = axp_wdt_timeout[sel];
++	return 0;
++}
++
++static int axp_wdt_ping(struct watchdog_device *wdd)
++{
++	struct axp_wdt *w = watchdog_get_drvdata(wdd);
++
++	return regmap_update_bits(w->regmap, AXP_WDT_CFG_REG,
++				  AXP_WDT_CLR, AXP_WDT_CLR);
++}
++
++static int axp_wdt_start(struct watchdog_device *wdd)
++{
++	struct axp_wdt *w = watchdog_get_drvdata(wdd);
++	int ret;
++
++	/* full PMIC power-cycle on timeout */
++	ret = regmap_update_bits(w->regmap, AXP_WDT_CFG_REG,
++				 AXP_WDT_MODE_MASK, AXP_WDT_MODE_RESTART);
++	if (ret)
++		return ret;
++
++	ret = axp_wdt_set_timeout(wdd, wdd->timeout);
++	if (ret)
++		return ret;
++
++	ret = axp_wdt_ping(wdd);
++	if (ret)
++		return ret;
++
++	return regmap_update_bits(w->regmap, AXP_WDT_CFG_REG,
++				  AXP_WDT_EN | AXP_WDT_CLK_EN,
++				  AXP_WDT_EN | AXP_WDT_CLK_EN);
++}
++
++static int axp_wdt_stop(struct watchdog_device *wdd)
++{
++	struct axp_wdt *w = watchdog_get_drvdata(wdd);
++
++	return regmap_update_bits(w->regmap, AXP_WDT_CFG_REG, AXP_WDT_EN, 0);
++}
++
++static const struct watchdog_info axp_wdt_info = {
++	.identity = "axp2xx pmic watchdog",
++	.options  = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
++};
++
++static const struct watchdog_ops axp_wdt_ops = {
++	.owner		= THIS_MODULE,
++	.start		= axp_wdt_start,
++	.stop		= axp_wdt_stop,
++	.ping		= axp_wdt_ping,
++	.set_timeout	= axp_wdt_set_timeout,
++};
++
++static int axp_wdt_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct axp_wdt *w;
++
++	w = devm_kzalloc(dev, sizeof(*w), GFP_KERNEL);
++	if (!w)
++		return -ENOMEM;
++
++	w->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!w->regmap)
++		return -ENODEV;
++
++	w->wdt.info		= &axp_wdt_info;
++	w->wdt.ops		= &axp_wdt_ops;
++	w->wdt.min_timeout	= AXP_WDT_MIN_TIMEOUT;
++	w->wdt.max_timeout	= AXP_WDT_MAX_TIMEOUT;
++	w->wdt.timeout		= AXP_WDT_DEF_TIMEOUT;
++	w->wdt.parent		= dev;
++
++	watchdog_set_drvdata(&w->wdt, w);
++	watchdog_init_timeout(&w->wdt, 0, dev);
++	watchdog_set_nowayout(&w->wdt, nowayout);
++
++	/* keep disabled until userspace opens the device */
++	regmap_update_bits(w->regmap, AXP_WDT_CFG_REG, AXP_WDT_EN, 0);
++
++	return devm_watchdog_register_device(dev, &w->wdt);
++}
++
++static const struct of_device_id axp_wdt_of_match[] = {
++	{ .compatible = "x-powers,axp2xx-watchdog" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, axp_wdt_of_match);
++
++static struct platform_driver axp_wdt_driver = {
++	.probe	= axp_wdt_probe,
++	.driver	= {
++		.name		= "axp2xx-watchdog",
++		.of_match_table	= axp_wdt_of_match,
++	},
++};
++module_platform_driver(axp_wdt_driver);
++
++MODULE_DESCRIPTION("X-Powers AXP2101-family PMIC watchdog");
++MODULE_AUTHOR("Radxa AIOT");
++MODULE_LICENSE("GPL");
+diff --git a/bsp/drivers/power/mfd/axp2101.c b/bsp/drivers/power/mfd/axp2101.c
+--- a/bsp/drivers/power/mfd/axp2101.c
++++ b/bsp/drivers/power/mfd/axp2101.c
+@@ -19,6 +19,7 @@
+ 
+ #include "sunxi-power-mfd.h"
+ #include "axp2101.h"
++#include <linux/reboot.h>
+ 
+ #define AXP20X_OFF	0x80
+ 
+@@ -3542,13 +3543,23 @@
+ 	if (axp20x_pm_power_off->variant == AXP288_ID)
+ 		return;
+ 
+-	regmap_write(axp20x_pm_power_off->regmap, AXP20X_OFF_CTRL,
+-		     AXP20X_OFF);
++	if (axp20x_pm_power_off->variant == AXP8191_ID)
++		regmap_update_bits(axp20x_pm_power_off->regmap,
++				   AXP8191_POWER_DISABLE_POWER_DOWN_SEQUENCE,
++				   BIT(7), BIT(7));
++	else
++		regmap_write(axp20x_pm_power_off->regmap, AXP20X_OFF_CTRL, AXP20X_OFF);
+ 
+ 	/* Give capacitors etc. time to drain to avoid kernel panic msg. */
+ 	msleep(500);
+ }
+ 
++static int axp_sys_power_off(struct sys_off_data *data)
++{
++	axp20x_power_off();
++	return NOTIFY_DONE;
++}
++
+ /*
+  * axp2101_dts_parse - axp2101 device tree parse
+  */
+@@ -4481,9 +4492,13 @@
+ 
+ 	axp20x_pm_power_off = axp20x;
+ 	axp_sysfs_init(axp20x);
+-	if (!pm_power_off) {
++	if (axp20x->variant == AXP8191_ID)
++		devm_register_sys_off_handler(axp20x->dev,
++					      SYS_OFF_MODE_POWER_OFF,
++					      SYS_OFF_PRIO_FIRMWARE + 1,
++					      axp_sys_power_off, NULL);
++	else if (!pm_power_off)
+ 		pm_power_off = axp20x_power_off;
+-	}
+ 
+ 	PMIC_DEV_INFO(axp20x->dev, "AXP20X driver loaded\n");
+ 

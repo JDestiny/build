@@ -19,6 +19,23 @@ tcpci_husb311 driver misuses platform_get_irq() on an i2c device and
 panics when client->irq is 0, so i2c core must resolve the interrupt.
 
 
+2026-09-19 additions (all verified with --fuzz=0 against this tree):
+- MIPI-CSI: the three VIN supplies (vind_mclkpin/vind_mcsipin/vind_mipipin)
+  wired to &reg_bldo1 at 1.8V like Radxa's own camera overlays, so
+  sunxi-vin-media can probe (without them regulator_get() returns the dummy
+  regulator and set_voltage() fails with -EINVAL).
+- pstore/ramoops: 1 MB reserved window at 0x58000000 (record 128K +
+  console 256K + pmsg 128K) so a panic leaves evidence across reboot.
+- AXP8191 PMIC watchdog subnode under &pmu0.
+- PCIe/NVMe HAT power: PD20 (PCIE_PWR_EN) is described as an always-on
+  regulator-fixed instead of the power-gpios property, which the PCIe host
+  driver fetches and then drives low.
+- GPU clock raised to 1008 MHz via the bare clk_rate property the PVR
+  driver parses (board level, not dtsi: the dtsi is shared with other boards).
+- usb_port_type kept at the official 0 (device): with 2 (OTG) the sunxi_usb
+  manager takes the VBUS_PMU branch and needs a det_vbus_supply this board
+  does not have, failing the probe and skipping even the device path.
+
 2026-09-06 decisions (documented in-tree as comments):
 - arisc_config: structural shell kept for parity with the official DT
   (label + "arisc-config" alias restored), but s_uart_config carries no
@@ -34,21 +51,21 @@ Signed-off-by: Cubie A7S Community <cubie-a7s@localhost>
 ---
 
 diff --git a/arch/arm64/boot/dts/allwinner/Makefile b/arch/arm64/boot/dts/allwinner/Makefile
-index 19993a9ca7..4435a24080 100644
 --- a/arch/arm64/boot/dts/allwinner/Makefile
 +++ b/arch/arm64/boot/dts/allwinner/Makefile
-@@ -43,4 +43,5 @@
+@@ -43,5 +43,6 @@
  dtb-$(CONFIG_ARCH_SUNXI) += sun50i-h618-orangepi-zero3.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7z.dtb
++dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7s.dtb
  dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-orangepi-4-pro.dtb
  dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-orangepi-zero3w.dtb
-+dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7s.dtb
- dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7z.dtb
+ 
 diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
 new file mode 100644
 index 000000000..e69de29bb2
 --- /dev/null
 +++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
-@@ -0,0 +1,2062 @@
+@@ -0,0 +1,2158 @@
 +// SPDX-License-Identifier: (GPL-2.0+ or MIT)
 +
 +/dts-v1/;
@@ -134,6 +151,19 @@ index 000000000..e69de29bb2
 +	   keep husb311 working.) Label added for __symbols__ parity with the
 +	   official tree; the arisc-config alias is restored in /aliases for
 +	   byte parity (2026-09-06 decision, no kernel consumers). */
++	reg_pcie_pwr: pcie-pwr {
++		/* FPC PCIe/NVMe HAT power-enable: PD20 = PCIE_PWR_EN (J3 pin14). */
++		compatible = "regulator-fixed";
++		regulator-name = "pcie-pwr";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-enable-ramp-delay = <1000>;
++		gpio = <&pio PD 20 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
 +	arisc_config: arisc_config {
 +		s_uart_config {
 +			status = "disabled";
@@ -1074,10 +1104,15 @@ index 000000000..e69de29bb2
 + */
 +&usbc0 {
 +	device_type = "usbc0";
-+	/* OTG mode (2): the official Radxa DT sets 0 (device-only) and lets the
-+	   TCPC/xhci2 path handle the port, but with 0 the UDC fails to register
-+	   (gadget -22) on this kernel; 2 was verified to bring up the UDC. */
-+	usb_port_type = <0x2>;		/* 0-device, 1-host, 2-otg */
++	/* Kept at the official DEVICE type on purpose: usb_port_type=<2> (OTG)
++	 * makes the sunxi_usb manager take the USB_DETECT_TYPE_VBUS_PMU branch
++	 * (usb_manager.c:797-808), which requires a det_vbus_supply power-supply
++	 * phandle that this board does not describe (its only power_supply is the
++	 * HUSB311 TCPM of the other Type-C port).  The probe then fails with -1
++	 * and *no* scan thread is started at all -- losing even the device/gadget
++	 * path that =0 sets up at :738-749.
++	 */
++	usb_port_type = <0x0>;
 +// #ifdef TYPEC_DP
 +// 	usb_detect_type = <0x3>;
 +// #else
@@ -1173,7 +1208,6 @@ index 000000000..e69de29bb2
 +&pcie_rc {
 +	pcie1v8-supply = <&reg_dc1sw1>;
 +	pcie3v3-supply = <&reg_bldo2>;
-+	power-gpios =  <&pio PD 20 GPIO_ACTIVE_HIGH>;
 +	reset-gpios = <&pio PD 22 GPIO_ACTIVE_HIGH>;
 +	wake-gpios = <&pio PD 21 GPIO_ACTIVE_HIGH>;
 +	status = "okay";
@@ -2070,6 +2104,7 @@ index 000000000..e69de29bb2
 +};
 +
 +&gpu  {
++	clk_rate = <1008000000>;
 +	gpu-supply = <&reg_dcdc4>;
 +};
 +
@@ -2110,4 +2145,82 @@ index 000000000..e69de29bb2
 +
 +&btlpm {
 +	status = "disabled"; /* BT over UART not used — AIC8800 BT via USB */
++};
++
++/*
++ * MIPI-CSI supplies -- mirror what Radxa's own camera overlays do.
++ *
++ * The vendor driver (bsp/drivers/vin/vin.c: vin_pinpower_get_set()) calls
++ * regulator_get()/regulator_set_voltage() for "vind_mclkpin", "vind_mcsipin"
++ * and "vind_mipipin".  Without a supply the regulator core hands out the
++ * dummy regulator, whose ops table is empty, so set_voltage() returns -EINVAL
++ * and sunxi-vin-media fails to probe:
++ *
++ *   sunxi-vin-media 5800800.vind: supply vind_mclkpin not found, using dummy regulator
++ *   sunxi:vin:[ERR]: vin_pinpower_get_set: set vind_mclkpin error, fail to set regulator voltage!
++ *   sunxi-vin-media: probe of 5800800.vind failed with error -1
++ *
++ * Radxa's r6 image ships three camera overlays
++ * (cubie-a7a-radxa-camera-{8m-219,13m-214,4k-415}.dtbo) that all point these
++ * three supplies at reg_bldo1 (AXP8191 BLDO1) with 0x1b7740 = 1.8 V, and also
++ * wire up the rest of the pipeline (vind0/csi/mipi/isp/scaler/vinc/sensor/twi3)
++ * plus the sensor's reset/pwdn GPIOs.
++ *
++ * Using the real rail (rather than a placeholder fixed regulator) also keeps
++ * it referenced: an unreferenced rail gets switched off by the unused-
++ * regulator sweep ~30 s after boot, which shows up as "sensor detected,
++ * /dev/video0 present, zero frames" (that is exactly what upstream patch
++ * 0008-orangepizero3w-keep-csi-camera-rail-always-on.patch fixes on Zero3W).
++ *
++ * Wiring only the supplies (not the full pipeline) is deliberate: it is the
++ * minimum needed for the media device to probe, and it leaves the sensor /
++ * ISP / scaler configuration to a per-camera overlay or a later patch.
++ */
++&vind0 {
++	vind_mclkpin-supply = <&reg_bldo1>;
++	vind_mclkpin_vol = <1800000>;
++	vind_mcsipin-supply = <&reg_bldo1>;
++	vind_mcsipin_vol = <1800000>;
++	vind_mipipin-supply = <&reg_bldo1>;
++	vind_mipipin_vol = <1800000>;
++};
++
++/* AXP8191 PMIC watchdog (0020): the vendor driver registers it from the PMIC
++   MFD node; the subnode is what the driver's of_match looks for. */
++&pmu0 {
++	watchdog {
++		compatible = "x-powers,axp2xx-watchdog";
++		status = "okay";
++	};
++};
++
++/*
++ * pstore / ramoops: keep crash evidence (panic/oops + console) in a small
++ * reserved RAM window so it survives a reboot.  With PSTORE disabled the
++ * board currently keeps *zero* evidence of a kernel oops (panic_on_oops=1,
++ * panic=0 -> hangs forever, nothing written anywhere).
++ *
++ * Address choice: DRAM starts at 0x40000000 and the only existing reserved
++ * region is bl31 (0x48000000 + 16 MB).  0x58000000 is comfortably above it,
++ * inside the first gigabyte, so it also works on 4 GB board variants.
++ * ramoops in this kernel does not support "alloc-ranges" (fs/pstore/ram.c
++ * only parses reg + size properties), hence a fixed physical window.
++ *
++ * Budget: record 128 KB (oops/panic dmesg) + console 256 KB + pmsg 128 KB
++ * = 512 KB inside a 1 MB window.
++ */
++/ {
++	reserved-memory {
++		#address-cells = <0x02>;
++		#size-cells = <0x02>;
++		ranges;
++
++		ramoops@58000000 {
++			compatible = "ramoops";
++			reg = <0x00 0x58000000 0x00 0x100000>;
++			record-size = <0x20000>;
++			console-size = <0x40000>;
++			pmsg-size = <0x20000>;
++		};
++	};
 +};
