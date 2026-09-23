@@ -1,0 +1,60 @@
+From: Cubie A7S bringup <local>
+Subject: [PATCH] media: sunxi-vin: export the OF modalias so udev auto-loads the driver
+
+bsp/drivers/vin/vin.c registers a platform driver with a proper OF match
+table but never exports it:
+
+    static const struct of_device_id sunxi_vin_match[] = {
+        {.compatible = "allwinner,sunxi-vin-media",},
+        {},
+    };
+    static struct platform_driver vin_driver = {
+        .driver = { .of_match_table = sunxi_vin_match, ... },
+    };
+
+Without MODULE_DEVICE_TABLE(of, ...) the built modules carry no "of:" alias,
+so udev has nothing to match the device modalias against and the driver is
+never loaded automatically:
+
+    $ modinfo vin_v4l2 | grep ^alias        # (no output)
+    $ cat /sys/bus/platform/devices/vind@5800800/modalias
+    of:NvindT(null)Callwinner,sunxi-vin-media
+
+Observed on the running system (kernel 6.6.98-vendor-sun60iw2 #7): after
+boot none of the VIN devices has a driver bound; only an explicit
+`modprobe vin_v4l2` gets csi/mipi/isp/vind to probe.  A camera therefore
+cannot work out of the box.
+
+Add the missing MODULE_DEVICE_TABLE(of, sunxi_vin_match); the modules then
+advertise
+
+    alias: of:N*T*Callwinner,sunxi-vin-media
+
+which matches the modalias above and makes udev load vin_io/vin_v4l2 (and
+the sensor modules, which declare their own compatibles) on demand.
+
+This is the same fix that was applied to the g2d driver
+(patch/.../0011-g2d-module-autoload.patch).
+
+Note: this is only half of the fix.  The top-level media device also needs
+the three board supplies (vind_mclkpin/mcsipin/mipipin), otherwise probing
+still fails with "error -1" before the OF alias can help -- see the
+companion dts patch (0012-armbian-dts-cubie-a7s-mipi-csi-supplies.patch).
+
+Baseline: Allwinner A733 SDK vendor kernel, bsp/drivers/vin/vin.c
+  (2026-09-17 copy, md5 6e3e5f60766c432c7d39635836e177fc).
+  Applies with `patch -p1` to the kernel tree used by the sun60iw2 vendor
+  family.
+
+---
+diff --git a/bsp/drivers/vin/vin.c b/bsp/drivers/vin/vin.c
+--- a/bsp/drivers/vin/vin.c
++++ b/bsp/drivers/vin/vin.c
+@@ -2807,6 +2807,7 @@
+ 	{.compatible = "allwinner,sunxi-vin-media",},
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, sunxi_vin_match);
+ 
+ static struct platform_driver vin_driver = {
+ 	.probe = vin_probe,
