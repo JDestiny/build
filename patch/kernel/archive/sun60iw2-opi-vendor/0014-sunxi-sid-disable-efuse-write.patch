@@ -1,0 +1,80 @@
+From: Cubie A7S bringup <local>
+Subject: [PATCH] sid: sunxi-sid: refuse the user-space eFuse write path (hardening)
+
+An eFuse bit can only be programmed from 0 to 1 and can never be erased
+(Allwinner 安全开发指南 2.2.4: "efuse 内部数据只能从 0 变成 1, 不能从 1 变成 0,
+只能写入一次").  Writing the wrong secure-enable / ROTPK / SSK bit is therefore
+irreversible and can permanently brick the SoC, so this path should not be
+reachable from user space on a normal running system.
+
+Vendor Android builds do enforce that: ueventd assigns explicit ownership to
+the SID nodes (e.g. /dev/sunxi_soc_info 0640 media media) and SELinux denies
+everything else -- /dev/sid_efuse is not even listed in file_contexts, so no
+user-space domain can open it, and burning happens in recovery/factory mode
+only.
+
+On the Linux/Armbian side none of that exists: the runtime LSM list is just
+"capability" (no SELinux/AppArmor; see
+C-实测与调查/Armbian-SELinux-调查-20260918.md) and no udev rule touches these
+nodes.  A udev rule was tried first and measured to be useless against the
+actual threat:
+
+    # /etc/udev/rules.d/99-sid-efuse.rules:  KERNEL=="sid_efuse", MODE="0000"
+    $ sudo python3 -c "import os; os.close(os.open('/dev/sid_efuse', os.O_WRONLY))"  # succeeds
+    $      python3 -c "same"                                                         # PermissionError
+
+root's CAP_DAC_OVERRIDE defeats mode 0000, so the only effective place to close
+this path is the kernel.
+
+This patch refuses SUNXI_EFUSE_WRITE in the ioctl handler.  Only two places in
+the whole BSP call arm_svc_efuse_write(): this ioctl branch and the internal
+kernel API (sunxi-sid.c:949), and no other driver uses it -- so the user-space
+write path is fully closed without affecting kernel functionality.  The read
+path, ChipID and calibration reads are untouched.
+
+The refusal uses `goto _out` on purpose: the function holds nfcr->mutex, and
+_out is where the lock is released and the temporary buffers wiped -- a plain
+`return -EPERM` would leak the lock.
+
+The original write sequence is left in place (now unreachable) so that a plain
+revert restores it verbatim.
+
+Baseline: Allwinner A733 SDK vendor kernel, bsp/drivers/sid/sunxi-sid.c
+  (2026-09-17 copy, md5 8f7a24a6e9959c429cf8679b9c8a4bfb).  Applies with
+  `patch -p1` to the kernel tree used by the sun60iw2 vendor family.
+
+Post-build check:
+  dmesg | grep -i "efuse write is disabled"        # appears after a write attempt
+  python3 -c "import os; os.close(os.open('/dev/sid_efuse', os.O_WRONLY))"
+      # open() still succeeds (device exists), but the write ioctl now returns -EPERM
+  # values read back via SUNXI_EFUSE_READ / ChipID / calibration are unchanged
+
+---
+diff --git a/bsp/drivers/sid/sunxi-sid.c b/bsp/drivers/sid/sunxi-sid.c
+--- a/bsp/drivers/sid/sunxi-sid.c
++++ b/bsp/drivers/sid/sunxi-sid.c
+@@ -867,6 +867,24 @@
+ 		}
+ 		break;
+ 	case SUNXI_EFUSE_WRITE:
++		/*
++		 * Hardening (Cubie A7S / Armbian, see 0014): an eFuse bit can only
++		 * be programmed from 0 to 1 and can never be erased, so writing the
++		 * wrong secure-enable / ROTPK / SSK bit is irreversible and can
++		 * permanently brick the SoC.  DAC permissions cannot stop root
++		 * (CAP_DAC_OVERRIDE defeats mode 0000 -- verified on this board),
++		 * so the user-space write path is refused here, in the kernel.
++		 *
++		 * The read path, ChipID and calibration data are unaffected.
++		 * Factory programming needs a kernel without this change (or the
++		 * vendor's own burning tool under a permissive build).
++		 *
++		 * The original write sequence is kept below (now unreachable) so
++		 * that a plain revert restores it verbatim.
++		 */
++		pr_err("sunxi-sid: efuse write is disabled in this build (hardening)\n");
++		err = -EPERM;
++		goto _out;
+ 		addr = (uintptr_t)nfcr->key_store.key_data;
+ 		if (copy_from_user(nfcr->temp_data,
+ 				   (void *)addr,
