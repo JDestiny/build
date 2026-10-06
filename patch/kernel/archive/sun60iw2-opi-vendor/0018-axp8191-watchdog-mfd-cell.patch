@@ -1,0 +1,72 @@
+From: Cubie A7S bringup <local>
+Subject: [PATCH] mfd: axp2101: register the axp2xx-watchdog cell for the AXP8191 variant
+
+
+System #9 enabled CONFIG_AW_AXP_WATCHDOG=y (the one-line fix TF asked for in the
+#8 receipt) and the driver is now built in -- /sys/bus/platform/drivers/
+axp2xx-watchdog exists -- but the watchdog still never appears:
+
+    $ ls /sys/class/watchdog/            -> only watchdog0   (2050000.watchdog, SoC)
+    $ ls /sys/bus/platform/devices/      -> only 2050000.watchdog
+    $ dmesg | grep -i axp2xx             -> nothing
+
+Root cause: the MFD cell that instantiates the driver is defined only in
+axp2101_cells[] (this file, line 2191):
+
+        {
+                .name = "axp2xx-watchdog",
+                .of_compatible = "x-powers,axp2xx-watchdog",
+        },
+
+but this board reports "AXP20x variant AXP8191 found" and the variant dispatch
+therefore registers axp8191_cells[] instead:
+
+        axp2101.c:4255   axp20x->nr_cells = ARRAY_SIZE(axp8191_cells);
+        axp2101.c:4256   axp20x->cells    = axp8191_cells;
+
+axp8191_cells[] (line 3145) has no watchdog entry, so mfd_add_devices() never
+creates the platform device, the driver's probe is never called, and the DTB
+node (which #8/#9 already ship: twi@7083000/pmu@36/watchdog,
+compatible = "x-powers,axp2xx-watchdog", status = "okay") has nothing to bind to.
+
+Patch 0019 in the TF series added the driver, the Kconfig symbol and the
+Makefile line, and explicitly did NOT add this cell because "our tree already
+has it" -- true for axp2101_cells[], wrong for the array this board uses.
+
+Fix: add the same cell to axp8191_cells[].  Nothing else changes; the driver and
+its of_match_table are already correct, and the node stays optional (a DTB
+without the node simply gets no watchdog device).
+
+Expected after rebuild (system #10):
+
+    $ ls /sys/class/watchdog/
+    watchdog0  watchdog1
+    $ dmesg | grep -i axp2xx
+    axp2xx-watchdog 7083000.twi:pmu@36:watchdog: ... (driver banner)
+
+Note on the acceptance criteria: CONFIG_WATCHDOG_SYSFS is not set in this
+config, so /sys/class/watchdog/*/{identity,state,timeout} are not created for
+ANY watchdog (the SoC one has none either).  Judge WD-2/WD-3 by the device
+count plus `wdctl` / dmesg, or add CONFIG_WATCHDOG_SYSFS=y to the config
+(TF has flagged this in the #9 receipt).
+
+Baseline: bsp/drivers/power/mfd/axp2101.c:3145 (axp8191_cells[]) and :2191 (the
+cell as it exists in axp2101_cells[]); verified with --fuzz=0 against the tree
+Armbian actually builds.
+
+Signed-off-by: Cubie A7S bringup <local>
+---
+diff --git a/bsp/drivers/power/mfd/axp2101.c b/bsp/drivers/power/mfd/axp2101.c
+--- a/bsp/drivers/power/mfd/axp2101.c
++++ b/bsp/drivers/power/mfd/axp2101.c
+@@ -3160,6 +3160,10 @@ static struct mfd_cell axp8191_cells[] = {
+ 		.num_resources = ARRAY_SIZE(axp8191_temp_ctrl_resources),
+ 
+ 	},
++	{
++		.name = "axp2xx-watchdog",
++		.of_compatible = "x-powers,axp2xx-watchdog",
++	},
+ 	{
+ 		.of_compatible = "xpower-vregulator,dcdc1",
+ 		.name = "reg-virt-consumer",
